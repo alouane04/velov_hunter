@@ -16,145 +16,153 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 JCDECAUX_API_KEY = os.environ.get("JCDECAUX_API_KEY")
 CONTRACT = os.environ.get("JCDECAUX_CONTRACT", "lyon")
 
+CYCLOCITY_AUTH = "Taknv1 eyJhbGciOiJSUzI1NiIsInppcCI6IkRFRiJ9.eJzNmM2O2jAQx9_F5zTqqqu2m3MfoOq16sFxBjD4I_UHECHevXZIILTxEi_e0FMcT8bm_9PMeMwBaVuiAm2ZzndQ5qyRovj-4xvKELaVM1glCoM34kMlOaaiIA1hsvsC9jUqnr58fXn--Onz80uGtqCcy5Mz1Yqj4oCI5PmaVECw3eetK6GmyQlWlfZ2AwIVPxEBtWycV2VLRoUbGGmZtBrccEuZoFb7EWYgiJ8TWJCmfXKr3LPfoqQbb2ZWVO7BLVt1ixjZYI7doATtfKXfg1HGQBsluXvRsPWvp7UN6HaVPfBSWrX0L2v309ZYtGsoZ_G-HhKnINqvm3ZRjhUtpUK_MqQka7V5rYUCXPlJUrvJw_GYBdFIYRQmJh5PD2WIaS48QyRDVGc8PZcO1ABPr3c6ogX-PUbnQmKA54wsMZ0LkCtOV1DOqG7SCQaPlzodTCWJ5SBej51RTIlTK0DnjbETpHPWWxDmvjWTIHkh8YD-DZ-_wPS87kqu8fC5WXuCydVqnR4_eiXrMTSj5eaVzLoLTdrMCqJptUagMdhQKWAbSK8RLrNHT-r0utI8HZVcLEDFh9E8JSh1hp3Exh3viSr0e2RZ8uank3sClA3OM7cX7CLAKdgFmsb_IaxSc-vUTseDCZH2VmmaoS9Ke7AF-fRy-4M_iydGK-dIDR1tBsZIvVunnbZbCpaqi-CYdqlWkoDWo5RiI2u-luntlM568xobssrdpZcVO0WN32zU2JWzgE27DnUSaF8OH33nmykS4yp_jdWGiuXDA3Cm0t_LjQCkKHEej24pZkvQVm106x7ftT-yI73jYnOSO7j6Zf1cREwFLzqz_kWXtokPplzghnM8_gHMnj_c.cvKI7wcPUP4AhiEbqXYtGoQkh3G0Sz8vBJvZO-d9tmNzMftNW2MbwJ80x1npy7lk0FQ6ArWRo0MLi2NN1JInCoR_LSBJ2PyPcx92a1qhmBOR1AkMl4RjQUFb8JUWuyGTtWqmh1U6az9JS40UWT76XmEaTQSZZSlU3UsUvgvSxyR0GzQ5tn6SGUnAVpm_rR-FfHYWu3ZFImIbEMYlIiK5HpNY6SEoRvzHWUOITBBDjlJWOSpuu0sATycSGDQKrG5aT5lzNljcwqa6qpbYM83lonnaj2UnmCvnBBIB74ztLmwVhlfVWYsM4mB5XcA1I11Ua09XD1JJs8OqqgcqgEM3nQ"
+
 DEFAULT_TARGET_STATIONS = [5030, 5008, 5047, 5016, 5007] 
 
 # Initialize the bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 geolocator = Nominatim(user_agent="velov_telegram_bot_v2")
 
-# Keep track of active hunts: chat_id -> threading.Event
+# Keep track of active hunts: chat_id -> dict {'stop_event': Event, 'interval': int}
 active_hunts = {}
 
+# Cache for station names and positions so we don't query JCDecaux every time
+STATION_CACHE = {}
+
+def update_station_cache():
+    url = f"https://api.jcdecaux.com/vls/v3/stations?contract={CONTRACT}&apiKey={JCDECAUX_API_KEY}"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            for st in res.json():
+                STATION_CACHE[st['number']] = st
+            print(f"✅ Cached {len(STATION_CACHE)} stations from JCDecaux")
+    except Exception as e:
+        print("Failed to cache stations:", e)
+
+# Initial cache load
+update_station_cache()
+
 def get_distance(lat1, lon1, lat2, lon2):
-    """Calculate the great circle distance between two points on the earth."""
-    # Haversine formula
-    R = 6371.0 # Earth radius in kilometers
+    R = 6371.0 
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    distance = R * c
-    return distance
+    return R * c
 
 def get_walking_distance(lat1, lon1, lat2, lon2):
-    """Get actual walking distance in km using OSRM API."""
     url = f"http://router.project-osrm.org/route/v1/foot/{lon1},{lat1};{lon2},{lat2}?overview=false"
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get('code') == 'Ok':
-                return data['routes'][0]['distance'] / 1000.0 # convert to km
+                return data['routes'][0]['distance'] / 1000.0 
     except Exception:
         pass
-    # Fallback to haversine * 1.3 (approx road factor) if OSRM fails
     return get_distance(lat1, lon1, lat2, lon2) * 1.3
 
 def find_closest_stations(lat, lon, num_stations=5):
-    """Fetch all stations and find the N closest ones to the given coords."""
-    url = f"https://api.jcdecaux.com/vls/v3/stations?contract={CONTRACT}&apiKey={JCDECAUX_API_KEY}"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            stations = response.json()
-            # Calculate distance for each
-            for st in stations:
-                st_pos = st.get('position', {})
-                st_lat = st_pos.get('latitude')
-                st_lon = st_pos.get('longitude')
-                if st_lat and st_lon:
-                    st['distance'] = get_distance(lat, lon, st_lat, st_lon)
-                else:
-                    st['distance'] = float('inf')
+    if not STATION_CACHE:
+        update_station_cache()
+    
+    stations = list(STATION_CACHE.values())
+    for st in stations:
+        st_pos = st.get('position', {})
+        st_lat = st_pos.get('latitude')
+        st_lon = st_pos.get('longitude')
+        if st_lat and st_lon:
+            st['distance'] = get_distance(lat, lon, st_lat, st_lon)
+        else:
+            st['distance'] = float('inf')
             
-            # Sort by straight-line distance first
-            stations.sort(key=lambda x: x['distance'])
-            
-            # Take top 10 to check actual walking distance via OSRM to avoid spamming the API
-            top_candidates = stations[:10]
-            for st in top_candidates:
-                st['walk_distance'] = get_walking_distance(lat, lon, st['position']['latitude'], st['position']['longitude'])
-                
-            # Re-sort by actual walking distance
-            top_candidates.sort(key=lambda x: x['walk_distance'])
-            
-            # Override 'distance' so it displays the walking distance in the chat
-            for st in top_candidates:
-                st['distance'] = st['walk_distance']
-            
-            # Filter out stations more than ~12 mins walk away (e.g. 1.0 km actual walk)
-            filtered_stations = [st for st in top_candidates if st['walk_distance'] <= 1.0]
-            
-            # If there are NO stations within 1km walk, at least give them the 1 closest station
-            if not filtered_stations and top_candidates:
-                filtered_stations = [top_candidates[0]]
-                
-            closest_n = filtered_stations[:num_stations]
-            return [st['number'] for st in closest_n], closest_n
-    except Exception as e:
-        print(f"Error fetching stations for distance: {e}")
-    return DEFAULT_TARGET_STATIONS, []
+    stations.sort(key=lambda x: x['distance'])
+    top_candidates = stations[:10]
+    
+    for st in top_candidates:
+        st_pos = st.get('position', {})
+        st['walk_distance'] = get_walking_distance(lat, lon, st_pos.get('latitude'), st_pos.get('longitude'))
+        
+    top_candidates.sort(key=lambda x: x['walk_distance'])
+    for st in top_candidates:
+        st['distance'] = st['walk_distance']
+    
+    filtered_stations = [st for st in top_candidates if st['walk_distance'] <= 1.0]
+    if not filtered_stations and top_candidates:
+        filtered_stations = [top_candidates[0]]
+        
+    closest_n = filtered_stations[:num_stations]
+    return [st['number'] for st in closest_n], closest_n
 
 def stop_hunt_for_chat(chat_id):
-    """Stop the hunt for a given chat_id, returns True if a hunt was stopped."""
     if chat_id in active_hunts:
-        active_hunts[chat_id].set()
+        active_hunts[chat_id]['stop_event'].set()
         del active_hunts[chat_id]
         return True
     return False
 
-def fetch_and_check_stations(chat_id, target_stations, stop_event):
-    """The background task that runs for 30 minutes, checking individual stations."""
-    bot.send_message(chat_id, f"🕵️‍♂️ **Hunt started!** Checking {len(target_stations)} stations every 15 seconds for 30 minutes. Send /stop to cancel.", parse_mode="Markdown")
+def fetch_and_check_stations(chat_id, target_stations, hunt_state):
+    bot.send_message(chat_id, f"🕵️‍♂️ **Hunt started!** Checking {len(target_stations)} stations for electric bikes. Send /stop to cancel.", parse_mode="Markdown")
     
     end_time = time.time() + (30 * 60)
     notified_stations = set()
+    stop_event = hunt_state['stop_event']
 
     while time.time() < end_time and not stop_event.is_set():
         for station_id in target_stations:
             if stop_event.is_set():
                 break
                 
-            url = f"https://api.jcdecaux.com/vls/v3/stations/{station_id}?contract={CONTRACT}&apiKey={JCDECAUX_API_KEY}"
+            url = f"https://api.jcdecaux.com/vls/v3/stations/{station_id}?contract={CONTRACT}&apiKey={JCDECAUX_API_KEY}&_={int(time.time()*1000)}"
             try:
                 response = requests.get(url, timeout=10)
                 if response.status_code == 200:
                     station = response.json()
-                    name = station.get("name", f"Station {station_id}")
                     
                     main_stands = station.get("mainStands", {}).get("availabilities", {})
-                    total_bikes = station.get("available_bikes", main_stands.get("bikes", 0))
                     electrical = main_stands.get("electricalBikes", 0)
                     mechanical = main_stands.get("mechanicalBikes", 0)
+                    total_bikes = station.get("available_bikes", main_stands.get("bikes", 0))
                     
-                    if total_bikes > 0 and station_id not in notified_stations:
+                    cached_st = STATION_CACHE.get(station_id, {})
+                    name = cached_st.get("name", f"Station {station_id}")
+                    lat = cached_st.get("position", {}).get("latitude")
+                    lon = cached_st.get("position", {}).get("longitude")
+                    
+                    if electrical > 0 and station_id not in notified_stations:
                         msg = (
-                            f"🚲 **BIKE FOUND AT {name}**\n\n"
-                            f"Total Available: **{total_bikes}**\n"
-                            f"⚡ Electric: {electrical}\n"
+                            f"🚲 **ELECTRIC BIKE FOUND AT {name}**\n\n"
+                            f"⚡ Electric: **{electrical}**\n"
                             f"⚙️ Mechanical: {mechanical}\n"
+                            f"Total Available: {total_bikes}\n"
                         )
-                        lat = station.get("position", {}).get("latitude")
-                        lon = station.get("position", {}).get("longitude")
                         
                         markup = InlineKeyboardMarkup()
+                        
+                        btn_row1 = []
                         if lat and lon:
                             maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-                            markup.add(InlineKeyboardButton("🗺️ Open in Google Maps", url=maps_url))
-                        markup.add(InlineKeyboardButton("🛑 Stop Hunting", callback_data="stop_hunt"))
+                            btn_row1.append(InlineKeyboardButton("🗺️ Map", url=maps_url))
+                        btn_row1.append(InlineKeyboardButton("🛑 Stop", callback_data="stop_hunt"))
+                        markup.add(*btn_row1)
+                        
+                        # Snipe button on its own row
+                        markup.add(InlineKeyboardButton("🎯 Snipe Mode (Check every 3s)", callback_data="snipe_mode"))
                         
                         bot.send_message(chat_id, msg, parse_mode="Markdown", reply_markup=markup)
                         notified_stations.add(station_id)
                         
-                    elif total_bikes == 0 and station_id in notified_stations:
-                        msg = f"Station {name} is empty again"
+                    elif electrical == 0 and station_id in notified_stations:
+                        msg = f"Station {name} has no electric bikes anymore."
                         bot.send_message(chat_id, msg, parse_mode="Markdown")
                         notified_stations.remove(station_id)
             except Exception as e:
                 print(f"Error fetching data for {station_id}: {e}")
                 
-        # Wait 15 seconds, but allow quick interruption if stop_event is set
-        stop_event.wait(15)
+        # Wait using the dynamically adjustable interval
+        stop_event.wait(hunt_state['interval'])
         
     if not stop_event.is_set():
         bot.send_message(chat_id, "🏁 **30-minute monitoring complete.** Send /findbikes or a location to start again.", parse_mode="Markdown")
@@ -164,9 +172,10 @@ def fetch_and_check_stations(chat_id, target_stations, stop_event):
 def start_hunt(chat_id, target_stations):
     stop_hunt_for_chat(chat_id)
     stop_event = threading.Event()
-    active_hunts[chat_id] = stop_event
+    hunt_state = {'stop_event': stop_event, 'interval': 15}
+    active_hunts[chat_id] = hunt_state
     
-    monitor_thread = threading.Thread(target=fetch_and_check_stations, args=(chat_id, target_stations, stop_event))
+    monitor_thread = threading.Thread(target=fetch_and_check_stations, args=(chat_id, target_stations, hunt_state))
     monitor_thread.start()
 
 # --- BOT MESSAGE HANDLERS ---
@@ -178,7 +187,7 @@ def send_welcome(message):
 @bot.message_handler(commands=['stop'])
 def cmd_stop(message):
     if stop_hunt_for_chat(message.chat.id):
-        bot.reply_to(message, "🛑 Hunt stopped.")
+        bot.reply_to(message, "🛑 Hunt stopped. Send /findbikes to start a new one.")
     else:
         bot.reply_to(message, "No active hunt to stop.")
 
@@ -208,7 +217,6 @@ def handle_text(message):
         
     bot.reply_to(message, f"🔍 Searching for address: {text}...")
     try:
-        # Default to Lyon, France to make searches easier
         location = geolocator.geocode(f"{text}, Lyon, France", timeout=10)
         if location:
             bot.send_message(message.chat.id, f"📍 Found: {location.address}\nFinding closest stations...")
@@ -224,16 +232,30 @@ def handle_text(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"Error geocoding: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data == "stop_hunt")
-def callback_stop_hunt(call):
-    if stop_hunt_for_chat(call.message.chat.id):
-        bot.answer_callback_query(call.id, "Hunt stopped!")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        bot.send_message(call.message.chat.id, "🛑 Hunt stopped successfully.")
-    else:
-        bot.answer_callback_query(call.id, "Hunt already stopped.")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+@bot.callback_query_handler(func=lambda call: call.data in ["stop_hunt", "snipe_mode"])
+def callback_inline(call):
+    chat_id = call.message.chat.id
+    if call.data == "stop_hunt":
+        if stop_hunt_for_chat(chat_id):
+            bot.answer_callback_query(call.id, "Hunt stopped!")
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            bot.send_message(chat_id, "🛑 Hunt stopped successfully. Send /findbikes to start a new one.")
+        else:
+            bot.answer_callback_query(call.id, "Hunt already stopped.")
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+            
+    elif call.data == "snipe_mode":
+        if chat_id in active_hunts:
+            active_hunts[chat_id]['interval'] = 3
+            bot.answer_callback_query(call.id, "🎯 Snipe Mode activated! Checking every 3s.")
+            # Remove the snipe button so they don't click it again
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛑 Stop", callback_data="stop_hunt"))
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=markup)
+            bot.send_message(chat_id, "🎯 **Snipe Mode Activated**\nChecking every 3 seconds! Go go go!", parse_mode="Markdown")
+        else:
+            bot.answer_callback_query(call.id, "No active hunt to snipe.", show_alert=True)
 
 if __name__ == "__main__":
     print("🤖 Bot is running and waiting for commands...")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
